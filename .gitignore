@@ -1,0 +1,15 @@
+# Build output
+/snitch
+*.exe
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local Claude Code project memory (per-machine)
+.claude/
+
+# Go
+*.test
+*.out
