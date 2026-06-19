@@ -8,9 +8,14 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"snitch/internal/notify"
 	"snitch/internal/state"
 	"snitch/internal/transcript"
 )
@@ -84,12 +89,53 @@ func Run(ctx context.Context, extraArgs []string) error {
 		logger.Printf("approve_now: injected \\r")
 	}
 
+	pset := newPendingSet()
+	app := newApprover(pset, w, ay, sess, &sessMu, logger)
+
+	// Permission-prompt detection via pty scanning. The transcript path
+	// only sees `tool_use` *after* claude has resolved the permission, so
+	// it can't be the trigger for auto-yes. The pty byte stream is the
+	// only signal that arrives while the prompt is still up. Debounced so
+	// one rendered prompt fires at most once.
+	var (
+		promptMu   sync.Mutex
+		promptLast time.Time
+	)
+	w.SetOnPrompt(func() {
+		promptMu.Lock()
+		if time.Since(promptLast) < 500*time.Millisecond {
+			promptMu.Unlock()
+			return
+		}
+		promptLast = time.Now()
+		promptMu.Unlock()
+
+		if ay.Enabled() {
+			if err := w.Inject([]byte{'\r'}); err != nil {
+				logger.Printf("pty auto-yes inject failed: %v", err)
+				return
+			}
+			logger.Printf("auto-yes fired (pty pattern)")
+			return
+		}
+		// Auto-yes off — surface the prompt to the user via notification.
+		sessMu.Lock()
+		cwd := sess.CWD
+		sessMu.Unlock()
+		notify.Notify(
+			fmt.Sprintf("Claude needs permission · %s", sessionLabel(cwd, wrapperPID)),
+			shortCWD(cwd),
+		)
+		logger.Printf("notify: permission (pty pattern)")
+	})
+
 	bgCtx, bgCancel := context.WithCancel(ctx)
 	defer bgCancel()
 
 	go cs.serve(bgCtx)
 	go writeRegistrationLoop(bgCtx, snapshot, wrapperPID, logger)
-	go enrich(bgCtx, sess, &sessMu, cs, w, ay, logger)
+	go app.run(bgCtx)
+	go enrich(bgCtx, sess, &sessMu, cs, w, ay, pset, app, logger)
 
 	// Foreground: pty I/O. Returns when claude exits.
 	runErr := w.Run()
@@ -163,6 +209,10 @@ type claudeSessionFile struct {
 // On every change of sessionId we cancel the in-flight tail goroutine and
 // start a fresh one against the new transcript. The tail itself seeks to end
 // so historical events from a resumed session do not replay.
+//
+// enrich also fires the "claude is waiting" OS notification on every
+// busy → waiting transition where no permission is pending, throttled per
+// session so consecutive idle blips don't spam.
 func enrich(
 	ctx context.Context,
 	sess *state.Session,
@@ -170,6 +220,8 @@ func enrich(
 	cs *controlServer,
 	pw *PTYWrapper,
 	ay *autoYes,
+	pset *pendingSet,
+	app *approver,
 	logger *log.Logger,
 ) {
 	cf := state.ClaudeSessionFile(sess.ClaudePID)
@@ -177,7 +229,11 @@ func enrich(
 	gate := &tailGate{}
 	defer gate.stop()
 
-	var currentSessID string
+	var (
+		currentSessID  string
+		prevStatus     string
+		lastIdleNotify time.Time
+	)
 
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
@@ -197,6 +253,7 @@ func enrich(
 		mu.Lock()
 		statusChanged := sess.Status != f.Status
 		idChanged := f.SessionID != "" && f.SessionID != currentSessID
+		hasPending := sess.Pending != nil
 		sess.Status = f.Status
 		if idChanged {
 			sess.SessionID = f.SessionID
@@ -205,11 +262,27 @@ func enrich(
 		if statusChanged || idChanged {
 			sess.UpdatedAt = time.Now()
 		}
+		cwd := sess.CWD
+		wrapperPID := sess.WrapperPID
 		mu.Unlock()
 
 		if statusChanged || idChanged {
 			cs.Broadcast(snapshotFromMu(sess, mu))
 		}
+
+		// Idle notification: claude just stopped working and isn't blocked on
+		// a permission prompt. Fire at most once per 30s per wrapper.
+		if statusChanged && f.Status == "waiting" && prevStatus != "waiting" && !hasPending {
+			if time.Since(lastIdleNotify) > 30*time.Second {
+				notify.Notify(
+					fmt.Sprintf("Claude waiting for input · %s", sessionLabel(cwd, wrapperPID)),
+					shortCWD(cwd),
+				)
+				lastIdleNotify = time.Now()
+				logger.Printf("notify: idle (status=waiting, no pending)")
+			}
+		}
+		prevStatus = f.Status
 
 		if !idChanged {
 			continue
@@ -219,9 +292,102 @@ func enrich(
 		path := transcript.File(f.CWD, f.SessionID)
 		logger.Printf("tailing transcript: %s", path)
 		gate.restart(ctx, func(tCtx context.Context) {
-			runTail(tCtx, path, sess, mu, cs, pw, ay, logger)
+			runTail(tCtx, path, sess, mu, cs, pw, ay, pset, app, logger)
 		})
 	}
+}
+
+// shortCWD collapses $HOME to ~ for a tighter notification body. Works on
+// any account (not just /Users/<user>) and renders the home root as "~".
+func shortCWD(cwd string) string {
+	if cwd == "" {
+		return ""
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if cwd == home {
+			return "~"
+		}
+		if strings.HasPrefix(cwd, home+string(os.PathSeparator)) {
+			return "~" + cwd[len(home):]
+		}
+	}
+	return cwd
+}
+
+func capFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	c, size := utf8.DecodeRuneInString(s)
+	return string(unicode.ToUpper(c)) + s[size:]
+}
+
+// sessionLabel identifies a session in notifications as "<folder>:<wrapperPID>"
+// so the user can tell which wrapper (matching the dash) fired the banner.
+func sessionLabel(cwd string, wrapperPID int) string {
+	return fmt.Sprintf("%s:%d", projectName(cwd), wrapperPID)
+}
+
+// projectName returns a short human-friendly label for a cwd. Returns
+// "Home" for $HOME and "Root" for "/" so notifications never expose the
+// username and never panic on edge paths.
+func projectName(cwd string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" && cwd == home {
+		return "Home"
+	}
+	parts := splitPath(cwd)
+	if len(parts) == 0 {
+		return "Root"
+	}
+	return capFirst(parts[len(parts)-1])
+}
+
+func splitPath(p string) []string {
+	clean := filepath.Clean(p)
+	var parts []string
+	for clean != "/" && clean != "." {
+		parts = append([]string{filepath.Base(clean)}, parts...)
+		clean = filepath.Dir(clean)
+	}
+	return parts
+}
+
+// pendingSet tracks every tool_use_id that has appeared without a matching
+// tool_result. A single sess.Pending pointer can't be used for auto-fire
+// decisions because claude can emit multiple parallel tool_use blocks in
+// one assistant turn — the second tool_use would overwrite the first's
+// Pending and the goroutine for the first would falsely conclude its tool
+// had already resolved.
+type pendingSet struct {
+	mu  sync.Mutex
+	set map[string]struct{}
+}
+
+func newPendingSet() *pendingSet {
+	return &pendingSet{set: make(map[string]struct{})}
+}
+
+func (p *pendingSet) add(tuid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.set[tuid] = struct{}{}
+}
+
+func (p *pendingSet) remove(tuid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.set[tuid]; !ok {
+		return false
+	}
+	delete(p.set, tuid)
+	return true
+}
+
+func (p *pendingSet) has(tuid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.set[tuid]
+	return ok
 }
 
 // tailGate keeps at most one transcript-tail goroutine running. Stashing the
@@ -256,11 +422,22 @@ func runTail(
 	cs *controlServer,
 	pw *PTYWrapper,
 	ay *autoYes,
+	pset *pendingSet,
+	app *approver,
 	logger *log.Logger,
 ) {
 	err := transcript.Tail(ctx, path, func(m map[string]any) {
 		ev := transcript.Classify(m)
 		if ev.Kind == transcript.KindOther {
+			if t, ok := m["type"].(string); ok {
+				switch t {
+				case "summary", "ai-title", "last-prompt", "permission-mode",
+					"attachment", "assistant", "system":
+					// Known shapes we don't classify but expect to see — skip log.
+				default:
+					logger.Printf("unclassified event type=%q", t)
+				}
+			}
 			return
 		}
 		mu.Lock()
@@ -270,6 +447,7 @@ func runTail(
 			Summary: ev.Summary(),
 			At:      now,
 		}
+		var resultCleared bool
 		switch ev.Kind {
 		case transcript.KindToolUse:
 			sess.Pending = &state.Pending{
@@ -282,13 +460,21 @@ func runTail(
 			if sess.Pending != nil && sess.Pending.ToolUseID == ev.ToolUseID {
 				sess.Pending = nil
 			}
+			resultCleared = pset.remove(ev.ToolUseID)
 		}
 		sess.UpdatedAt = now
 		mu.Unlock()
 		cs.Broadcast(snapshotFromMu(sess, mu))
 
-		if ev.Kind == transcript.KindToolUse {
-			go maybeAutoFire(ctx, sess, mu, cs, pw, ay, ev.ToolUseID, logger)
+		switch ev.Kind {
+		case transcript.KindToolUse:
+			pset.add(ev.ToolUseID)
+			logger.Printf("tool_use seen id=%s tool=%s", ev.ToolUseID, ev.Tool)
+			app.enqueue(ev.ToolUseID)
+		case transcript.KindToolResult:
+			if resultCleared {
+				logger.Printf("tool_result cleared pending id=%s", ev.ToolUseID)
+			}
 		}
 	})
 	if err != nil && ctx.Err() == nil {
@@ -323,20 +509,57 @@ func snapshotFromMu(sess *state.Session, mu *sync.Mutex) *state.Session {
 	return &c
 }
 
-// maybeAutoFire is launched per tool_use event. After a grace window, if the
-// pending tool_use still has no tool_result and auto-yes is on, inject \r.
-func maybeAutoFire(
-	ctx context.Context,
-	sess *state.Session,
-	mu *sync.Mutex,
-	cs *controlServer,
-	pw *PTYWrapper,
-	ay *autoYes,
-	tuid string,
-	logger *log.Logger,
-) {
+// approver serializes auto-yes injections. Claude shows permission prompts
+// one at a time — only after the previous tool's prompt is accepted does
+// the next render. So we must fire one \r, wait for that tool_use's
+// tool_result (= prompt accepted, tool ran), and only then fire the next.
+// Sending all \r's in parallel only ever approves the first prompt; the
+// rest land in claude's stdin before the next prompt is up and get
+// consumed as no-op chat input.
+type approver struct {
+	queue  chan string
+	pset   *pendingSet
+	pw     *PTYWrapper
+	ay     *autoYes
+	sess   *state.Session
+	sessMu *sync.Mutex
+	logger *log.Logger
+}
+
+func newApprover(pset *pendingSet, pw *PTYWrapper, ay *autoYes, sess *state.Session, sessMu *sync.Mutex, logger *log.Logger) *approver {
+	return &approver{
+		queue:  make(chan string, 64),
+		pset:   pset,
+		pw:     pw,
+		ay:     ay,
+		sess:   sess,
+		sessMu: sessMu,
+		logger: logger,
+	}
+}
+
+func (a *approver) enqueue(tuid string) {
+	select {
+	case a.queue <- tuid:
+	default:
+		a.logger.Printf("auto-yes queue full, dropping id=%s", tuid)
+	}
+}
+
+func (a *approver) run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case tuid := <-a.queue:
+			a.process(ctx, tuid)
+		}
+	}
+}
+
+func (a *approver) process(ctx context.Context, tuid string) {
 	const grace = 300 * time.Millisecond
-	const debounce = 800 * time.Millisecond
+	const resultWait = 10 * time.Second
 
 	select {
 	case <-ctx.Done():
@@ -344,21 +567,49 @@ func maybeAutoFire(
 	case <-time.After(grace):
 	}
 
-	mu.Lock()
-	stillPending := sess.Pending != nil && sess.Pending.ToolUseID == tuid
-	mu.Unlock()
+	if !a.pset.has(tuid) {
+		a.logger.Printf("auto-yes skip id=%s reason=cleared-before-grace on=%v", tuid, a.ay.Enabled())
+		return
+	}
 
-	if !stillPending {
+	on := a.ay.Enabled()
+	if !on {
+		a.logger.Printf("auto-yes skip id=%s reason=toggle-off", tuid)
+		a.sessMu.Lock()
+		cwd := a.sess.CWD
+		wrapperPID := a.sess.WrapperPID
+		a.sessMu.Unlock()
+		notify.Notify(
+			fmt.Sprintf("Claude needs permission · %s", sessionLabel(cwd, wrapperPID)),
+			shortCWD(cwd),
+		)
 		return
 	}
-	if !ay.claim(debounce) {
+
+	if err := a.pw.Inject([]byte{'\r'}); err != nil {
+		a.logger.Printf("auto-yes inject suppressed id=%s err=%v", tuid, err)
 		return
 	}
-	if err := pw.Inject([]byte{'\r'}); err != nil {
-		logger.Printf("auto-yes inject suppressed: %v", err)
-		return
+	a.logger.Printf("auto-yes fired for tool_use_id=%s", tuid)
+
+	// Block here until the tool_result for this tuid removes it from the
+	// set, OR the timeout fires. Holding here serializes the queue so the
+	// next \r is only sent when claude is ready for the next prompt.
+	deadline := time.Now().Add(resultWait)
+	for {
+		if !a.pset.has(tuid) {
+			return
+		}
+		if time.Now().After(deadline) {
+			a.logger.Printf("auto-yes wait timeout id=%s — moving on", tuid)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	logger.Printf("auto-yes fired for tool_use_id=%s", tuid)
 }
 
 func openDebugLog(wrapperPID int) (*log.Logger, func()) {

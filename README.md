@@ -91,6 +91,35 @@ alias claude='snitch run --'
 After that, `claude` and `claude --resume` both go through snitch. Open a
 second terminal and run `snitch dash` to see all live wrappers.
 
+### OS notifications
+
+The wrapper fires a desktop notification in two cases:
+
+- **Permission needed** — a `tool_use` is pending, auto-yes is off for this
+  session, and 300ms have passed since the prompt appeared. Body shows the
+  tool and a short preview of its input.
+- **Claude is waiting for input** — claude's status transitions to
+  `waiting` with no pending permission prompt (i.e. claude finished its
+  turn). Throttled to one notification per 30 seconds per wrapper so a
+  flicker between states doesn't spam.
+
+Notifications are delivered by writing the **iTerm2 OSC 9 escape
+sequence** to snitch's controlling terminal. Modern terminals (Ghostty,
+iTerm2, WezTerm, Konsole) translate that into a real desktop notification
+through their own notification permission slot — no extra binaries, no
+brew installs, no Go module dependencies.
+
+Terminals that don't speak OSC 9 (notably the JetBrains embedded
+terminal, stock xterm, gnome-terminal) silently ignore the sequence, so
+running snitch there just gives you no notifications rather than visible
+garbage.
+
+To turn notifications off entirely:
+
+```sh
+SNITCH_NOTIFY=0 snitch run
+```
+
 ### Dashboard keys
 
 - `↑/↓` or `j/k` — navigate

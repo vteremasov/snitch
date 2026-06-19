@@ -3,7 +3,6 @@ package wrapper
 import (
 	"bytes"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -30,7 +29,22 @@ type PTYWrapper struct {
 	// (\x1b[200~ ... \x1b[201~). Auto-yes injection should not fire while
 	// this is true.
 	inPaste atomic.Bool
+
+	// Permission-prompt detection state. The transcript jsonl doesn't show
+	// `tool_use` until *after* the prompt is resolved, so it can't be the
+	// trigger for auto-yes. Instead we sniff the pty master output for the
+	// signature claude paints when a permission UI is up. The rolling
+	// buffer is touched only from the output read loop, so it needs no
+	// mutex.
+	promptBuf []byte
+	onPrompt  func()
 }
+
+// SetOnPrompt installs a callback that fires whenever the permission-prompt
+// signature is detected in the pty output. The callback runs synchronously
+// from the output read loop, so it must be quick (or spawn its own
+// goroutine).
+func (w *PTYWrapper) SetOnPrompt(fn func()) { w.onPrompt = fn }
 
 // Start spawns argv[0] with argv[1:] under a freshly allocated pty. The
 // child inherits the parent's environment unchanged.
@@ -95,10 +109,65 @@ func (w *PTYWrapper) Run() error {
 	// stdin -> pty master, with paste-window tracking + write mutex.
 	go w.copyStdinToMaster()
 
-	// pty master -> stdout: pure passthrough.
-	_, _ = io.Copy(os.Stdout, w.master)
+	// pty master -> stdout, sniffing the byte stream for the permission-
+	// prompt signature inline. Bytes flow to the terminal unchanged.
+	w.copyMasterToStdoutAndScan()
 
 	return w.cmd.Wait()
+}
+
+// Permission-prompt signature. Claude paints a small menu like
+//
+//	❯ 1. Yes
+//	  2. Yes, and don't ask again (or similar)
+//	  3. No
+//
+// We require all three of `❯`, `Yes`, and `No` to be present in the
+// rolling buffer simultaneously. The trio is unlikely to coincide outside
+// the permission UI, and any number of intervening color/positioning
+// escapes between them is fine — we only check substring presence.
+//
+// Multiple "Yes" lines may appear in the menu; we don't care which we
+// matched, since pressing Enter always selects option 1 (the first "Yes").
+var (
+	sigCursor = []byte("❯")
+	sigYes    = []byte("Yes")
+	sigNo     = []byte("No")
+)
+
+const promptBufCap = 4096
+
+func (w *PTYWrapper) copyMasterToStdoutAndScan() {
+	buf := make([]byte, 8192)
+	for {
+		n, err := w.master.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			_, _ = os.Stdout.Write(chunk)
+			w.scanForPrompt(chunk)
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (w *PTYWrapper) scanForPrompt(chunk []byte) {
+	if w.onPrompt == nil {
+		return
+	}
+	w.promptBuf = append(w.promptBuf, chunk...)
+	if len(w.promptBuf) > promptBufCap {
+		w.promptBuf = w.promptBuf[len(w.promptBuf)-promptBufCap:]
+	}
+	if bytes.Contains(w.promptBuf, sigCursor) &&
+		bytes.Contains(w.promptBuf, sigYes) &&
+		bytes.Contains(w.promptBuf, sigNo) {
+		// Clear so the same render doesn't fire again on the next chunk.
+		// A new prompt will repaint the signature into a fresh buffer.
+		w.promptBuf = w.promptBuf[:0]
+		w.onPrompt()
+	}
 }
 
 func (w *PTYWrapper) copyStdinToMaster() {
