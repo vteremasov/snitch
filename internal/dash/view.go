@@ -3,7 +3,6 @@ package dash
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -17,6 +16,7 @@ var (
 	statusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
 	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 )
 
 func (m *Model) View() string {
@@ -92,7 +92,43 @@ func (m *Model) View() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(strings.Repeat("─", m.width))
+	b.WriteString(dimStyle.Render(strings.Repeat("─", m.width)))
+	b.WriteString("\n")
+
+	// Render Selected Session's Wrapper Log
+	s := m.selected()
+	if s == nil {
+		b.WriteString(dimStyle.Render("no active session selected"))
+		b.WriteString("\n")
+		// Pad remaining space
+		for i := 0; i < m.logViewportHeight; i++ {
+			b.WriteString("\n")
+		}
+	} else {
+		logTitle := fmt.Sprintf(" WRAPPER LOG (PID %d) · CWD: %s ", s.WrapperPID, shortCWD(s.CWD))
+		titleBar := drawTitleBar(logTitle, m.width)
+		b.WriteString(dimStyle.Render(titleBar))
+		b.WriteString("\n")
+
+		start := m.logScrollOffset
+		end := start + m.logViewportHeight
+		if end > len(m.logLines) {
+			end = len(m.logLines)
+		}
+
+		printed := 0
+		for i := start; i < end; i++ {
+			b.WriteString(m.logLines[i])
+			b.WriteString("\n")
+			printed++
+		}
+		for printed < m.logViewportHeight {
+			b.WriteString("\n")
+			printed++
+		}
+	}
+
+	b.WriteString(dimStyle.Render(strings.Repeat("─", m.width)))
 	b.WriteString("\n")
 
 	if m.statusLine != "" {
@@ -100,11 +136,25 @@ func (m *Model) View() string {
 		b.WriteString("\n")
 	}
 
-	help := "↑/↓ navigate · space toggle auto-yes · enter approve pending · A all on · N all off · p pending-only · q quit"
+	help := "↑/↓ navigate · space toggle auto-yes · enter approve pending · A/N auto-yes all/none · p pending-only · pgup/pgdn scroll logs · q quit"
 	b.WriteString(helpStyle.Render(help))
 
-	_ = time.Now()
 	return b.String()
+}
+
+func drawTitleBar(title string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if len(title) >= width {
+		return title[:width]
+	}
+	leftLen := 2
+	rightLen := width - len(title) - leftLen
+	if rightLen < 0 {
+		rightLen = 0
+	}
+	return strings.Repeat("─", leftLen) + title + strings.Repeat("─", rightLen)
 }
 
 func status(s string) string {

@@ -26,15 +26,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.updateViewportHeight()
+		m.refreshLogs()
 		return m, nil
 
 	case discoverTickMsg:
 		m.reconcileWrappers()
+		m.updateViewportHeight()
+		m.refreshLogs()
 		return m, discoverCmd()
 
 	case stateMsg:
 		m.sessions[msg.pid] = msg.session
 		m.rebuildOrder()
+		if s := m.selected(); s != nil && s.WrapperPID == msg.pid {
+			m.refreshLogs()
+		}
 		return m, nil
 
 	case removeMsg:
@@ -44,10 +51,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			delete(m.clients, msg.pid)
 		}
 		m.rebuildOrder()
+		m.updateViewportHeight()
+		m.refreshLogs()
 		return m, nil
 
+	case tea.MouseMsg:
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.autoScroll = false
+			m.logScrollOffset -= 3
+			if m.logScrollOffset < 0 {
+				m.logScrollOffset = 0
+			}
+			return m, nil
+		} else if msg.Button == tea.MouseButtonWheelDown {
+			m.logScrollOffset += 3
+			maxOffset := len(m.logLines) - m.logViewportHeight
+			if maxOffset < 0 {
+				maxOffset = 0
+			}
+			if m.logScrollOffset >= maxOffset {
+				m.logScrollOffset = maxOffset
+				m.autoScroll = true
+			}
+			return m, nil
+		}
+
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		model, cmd := m.handleKey(msg)
+		m.updateViewportHeight()
+		m.refreshLogs()
+		return model, cmd
 	}
 	return m, nil
 }
@@ -60,12 +93,54 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
+			m.autoScroll = true
 		}
 		return m, nil
 
 	case "down", "j":
 		if m.cursor < len(m.order)-1 {
 			m.cursor++
+			m.autoScroll = true
+		}
+		return m, nil
+
+	case "pgup", "ctrl+u":
+		m.autoScroll = false
+		m.logScrollOffset -= m.logViewportHeight / 2
+		if m.logScrollOffset < 0 {
+			m.logScrollOffset = 0
+		}
+		return m, nil
+
+	case "pgdn", "ctrl+d":
+		m.logScrollOffset += m.logViewportHeight / 2
+		maxOffset := len(m.logLines) - m.logViewportHeight
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		if m.logScrollOffset >= maxOffset {
+			m.logScrollOffset = maxOffset
+			m.autoScroll = true
+		}
+		return m, nil
+
+	case "shift+up":
+		m.autoScroll = false
+		m.logScrollOffset--
+		if m.logScrollOffset < 0 {
+			m.logScrollOffset = 0
+		}
+		return m, nil
+
+	case "shift+down":
+		m.logScrollOffset++
+		maxOffset := len(m.logLines) - m.logViewportHeight
+		if maxOffset < 0 {
+			maxOffset = 0
+		}
+		if m.logScrollOffset >= maxOffset {
+			m.logScrollOffset = maxOffset
+			m.autoScroll = true
 		}
 		return m, nil
 
@@ -190,4 +265,3 @@ func itoa(i int) string {
 	}
 	return string(buf[idx:])
 }
-

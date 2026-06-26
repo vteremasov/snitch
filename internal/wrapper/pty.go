@@ -3,15 +3,20 @@ package wrapper
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/creack/pty"
 	"golang.org/x/term"
+
+	"snitch/internal/state"
 )
 
 // PTYWrapper owns a child process attached to a pseudo-terminal. It copies
@@ -109,9 +114,19 @@ func (w *PTYWrapper) Run() error {
 	// stdin -> pty master, with paste-window tracking + write mutex.
 	go w.copyStdinToMaster()
 
+	// Create output file for capturing child PTY stdout
+	pid := os.Getpid()
+	outPath := filepath.Join(state.LogDir(), fmt.Sprintf("%d.out", pid))
+	outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	var outWriter io.Writer
+	if err == nil {
+		outWriter = outFile
+		defer outFile.Close()
+	}
+
 	// pty master -> stdout, sniffing the byte stream for the permission-
 	// prompt signature inline. Bytes flow to the terminal unchanged.
-	w.copyMasterToStdoutAndScan()
+	w.copyMasterToStdoutAndScan(outWriter)
 
 	return w.cmd.Wait()
 }
@@ -137,13 +152,16 @@ var (
 
 const promptBufCap = 4096
 
-func (w *PTYWrapper) copyMasterToStdoutAndScan() {
+func (w *PTYWrapper) copyMasterToStdoutAndScan(outFile io.Writer) {
 	buf := make([]byte, 8192)
 	for {
 		n, err := w.master.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
 			_, _ = os.Stdout.Write(chunk)
+			if outFile != nil {
+				_, _ = outFile.Write(chunk)
+			}
 			w.scanForPrompt(chunk)
 		}
 		if err != nil {
