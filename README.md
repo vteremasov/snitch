@@ -103,16 +103,13 @@ The wrapper fires a desktop notification in two cases:
   turn). Throttled to one notification per 30 seconds per wrapper so a
   flicker between states doesn't spam.
 
-Notifications are delivered by writing the **iTerm2 OSC 9 escape
-sequence** to snitch's controlling terminal. Modern terminals (Ghostty,
-iTerm2, WezTerm, Konsole) translate that into a real desktop notification
-through their own notification permission slot — no extra binaries, no
-brew installs, no Go module dependencies.
+**macOS Delivery:**
+- **With `terminal-notifier` (Recommended)** — If you install `terminal-notifier` (via `brew install terminal-notifier`), snitch will use it to deliver interactive notifications that automatically bring the target terminal (including JetBrains embedded terminals and Apple Terminal.app) to focus when clicked. It dynamically inspects the process hierarchy to find the correct active IDE or terminal app bundle identifier to activate.
+- **Native OSC 9** — If `terminal-notifier` is not present, snitch writes the **iTerm2 OSC 9 escape sequence** to its controlling terminal. Modern terminals (Ghostty, iTerm2, WezTerm, VS Code) translate this into a native notification, and clicking it focuses the terminal window/tab.
+- **AppleScript Fallback** — For other terminals, it falls back to macOS `osascript` to trigger a system banner.
 
-Terminals that don't speak OSC 9 (notably the JetBrains embedded
-terminal, stock xterm, gnome-terminal) silently ignore the sequence, so
-running snitch there just gives you no notifications rather than visible
-garbage.
+**Linux Delivery:**
+OSC 9 to `/dev/tty` plus `notify-send` if installed.
 
 To turn notifications off entirely:
 
@@ -127,6 +124,7 @@ SNITCH_NOTIFY=0 snitch run
 - `enter` — approve the selected session's pending prompt right now
 - `A` / `N` — auto-yes ON / off for all wrappers
 - `p` — toggle filter to show only sessions with a pending prompt
+- `w` or `c` — toggle keep-awake (uses macOS `caffeinate` to prevent system sleep while at least one wrapper is busy)
 - `q` or `ctrl+c` — quit
 
 ## Tested terminals
