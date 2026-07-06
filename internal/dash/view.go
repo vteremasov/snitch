@@ -26,9 +26,20 @@ func (m *Model) View() string {
 
 	var b strings.Builder
 
+	keepAwakeStr := "keep-awake: off"
+	if m.keepAwake {
+		if m.caffeinateCmd != nil {
+			keepAwakeStr = autoOnStyle.Render("keep-awake: ACTIVE")
+		} else {
+			keepAwakeStr = autoOffStyle.Render("keep-awake: on")
+		}
+	} else {
+		keepAwakeStr = dimStyle.Render("keep-awake: off")
+	}
+
 	header := fmt.Sprintf("snitch — %d active claude sessions", len(m.order))
 	b.WriteString(headerStyle.Render(header))
-	b.WriteString("\n")
+	b.WriteString("  " + keepAwakeStr + "\n")
 	b.WriteString(strings.Repeat("─", m.width))
 	b.WriteString("\n")
 
@@ -136,7 +147,7 @@ func (m *Model) View() string {
 		b.WriteString("\n")
 	}
 
-	help := "↑/↓ navigate · space toggle auto-yes · enter approve pending · A/N auto-yes all/none · p pending-only · pgup/pgdn scroll logs · q quit"
+	help := "↑/↓ navigate · space toggle auto-yes · enter approve pending · A/N auto-yes all/none · p pending-only · w keep-awake · pgup/pgdn scroll logs · q quit"
 	b.WriteString(helpStyle.Render(help))
 
 	return b.String()

@@ -21,7 +21,9 @@ package notify
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,18 +49,89 @@ func Notify(title, message string) {
 }
 
 func notifyDarwin(title, message string) {
-	// 1. OSC 9 — fires the visible banner reliably in Ghostty / iTerm2.
-	writeOSC9(title, message)
+	// If terminal-notifier is installed, use it as it provides click-to-focus for all terminals.
+	if path, err := exec.LookPath("terminal-notifier"); err == nil {
+		bundleID := getTerminalBundleID()
+		_ = exec.Command(path, "-title", title, "-message", message, "-sender", bundleID, "-activate", bundleID).Start()
+		return
+	}
 
-	// 2. osascript — covers terminals that don't speak OSC 9 and provides
-	// the audible cue via the "default" alert sound. Often silently
-	// dropped on Sonoma+ for visuals, but the sound clause still tends to
-	// play through.
-	script := "display notification " + appleScriptString(message) +
-		" with title " + appleScriptString(title) +
-		` sound name "default"`
-	_ = exec.Command("osascript", "-e", script).Start()
+	// Otherwise, fallback depending on terminal capabilities:
+	termProg := os.Getenv("TERM_PROGRAM")
+	if termProg == "iTerm.app" || termProg == "Ghostty" || termProg == "vscode" || termProg == "WezTerm" {
+		// 1. OSC 9 — Ghostty / iTerm2 natively handle this escape sequence and focus the terminal tab on click.
+		writeOSC9(title, message)
+		// Play sound natively without generating a duplicate visual notification.
+		_ = exec.Command("osascript", "-e", "beep").Start()
+	} else {
+		// 2. osascript — for terminals that don't speak OSC 9 (like Apple Terminal).
+		script := "display notification " + appleScriptString(message) +
+			" with title " + appleScriptString(title) +
+			` sound name "default"`
+		_ = exec.Command("osascript", "-e", script).Start()
+	}
 }
+
+func getTerminalBundleID() string {
+	termProg := os.Getenv("TERM_PROGRAM")
+	switch termProg {
+	case "Apple_Terminal":
+		return "com.apple.Terminal"
+	case "iTerm.app":
+		return "com.googlecode.iterm2"
+	case "Ghostty":
+		return "com.mitchellh.ghostty"
+	case "vscode":
+		return "com.microsoft.VSCode"
+	}
+
+	// Fallback to searching ancestor process hierarchy for an app bundle (like JetBrains IDEs)
+	if bundleID, ok := findAncestorAppBundleID(); ok {
+		return bundleID
+	}
+
+	return "com.apple.Terminal"
+}
+
+func findAncestorAppBundleID() (string, bool) {
+	curr := os.Getpid()
+	// Limit search depth to prevent infinite loops or excessive scanning
+	for depth := 0; depth < 15 && curr > 1; depth++ {
+		cmd := exec.Command("ps", "-p", strconv.Itoa(curr), "-o", "ppid=", "-o", "comm=")
+		output, err := cmd.Output()
+		if err != nil {
+			break
+		}
+
+		parts := strings.Fields(strings.TrimSpace(string(output)))
+		if len(parts) < 2 {
+			break
+		}
+
+		ppid, err := strconv.Atoi(parts[0])
+		if err != nil {
+			break
+		}
+
+		comm := strings.Join(parts[1:], " ")
+		if idx := strings.Index(comm, ".app/"); idx != -1 {
+			appPath := comm[:idx+4]
+			plistPath := filepath.Join(appPath, "Contents", "Info.plist")
+			if _, err := os.Stat(plistPath); err == nil {
+				defaultsCmd := exec.Command("defaults", "read", plistPath, "CFBundleIdentifier")
+				if bundleIDBytes, err := defaultsCmd.Output(); err == nil {
+					bundleID := strings.TrimSpace(string(bundleIDBytes))
+					if bundleID != "" {
+						return bundleID, true
+					}
+				}
+			}
+		}
+		curr = ppid
+	}
+	return "", false
+}
+
 
 // writeOSC9 emits the iTerm2 OSC 9 sequence to the controlling terminal.
 // The sequence is a single atomic write (well under PIPE_BUF), so racing

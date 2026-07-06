@@ -34,6 +34,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reconcileWrappers()
 		m.updateViewportHeight()
 		m.refreshLogs()
+		m.updateKeepAwake()
 		return m, discoverCmd()
 
 	case stateMsg:
@@ -42,6 +43,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if s := m.selected(); s != nil && s.WrapperPID == msg.pid {
 			m.refreshLogs()
 		}
+		m.updateKeepAwake()
 		return m, nil
 
 	case removeMsg:
@@ -53,6 +55,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rebuildOrder()
 		m.updateViewportHeight()
 		m.refreshLogs()
+		m.updateKeepAwake()
 		return m, nil
 
 	case tea.MouseMsg:
@@ -88,6 +91,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
+		m.stopCaffeinate()
 		return m, tea.Quit
 
 	case "up", "k":
@@ -198,6 +202,16 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusLine = "filter: all sessions"
 		}
+		return m, nil
+
+	case "w", "c":
+		m.keepAwake = !m.keepAwake
+		if m.keepAwake {
+			m.statusLine = "keep-awake ON (caffeinate when busy)"
+		} else {
+			m.statusLine = "keep-awake off"
+		}
+		m.updateKeepAwake()
 		return m, nil
 	}
 	return m, nil

@@ -10,7 +10,8 @@ import (
 // transcript events don't cause us to fire \r more than once per pending
 // permission.
 type autoYes struct {
-	on atomic.Bool
+	on           atomic.Bool
+	inPermission atomic.Bool
 
 	mu       sync.Mutex
 	lastFire time.Time
@@ -18,6 +19,10 @@ type autoYes struct {
 
 func (a *autoYes) Set(on bool) { a.on.Store(on) }
 func (a *autoYes) Enabled() bool { return a.on.Load() }
+
+func (a *autoYes) SetInPermissionPrompt(in bool) { a.inPermission.Store(in) }
+func (a *autoYes) InPermissionPrompt() bool      { return a.inPermission.Load() }
+
 
 // claim returns true if a fire is allowed right now. It resets the debounce
 // window unconditionally so callers don't need to track it.

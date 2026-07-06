@@ -110,6 +110,8 @@ func Run(ctx context.Context, extraArgs []string) error {
 		promptLast = time.Now()
 		promptMu.Unlock()
 
+		ay.SetInPermissionPrompt(true)
+
 		if ay.Enabled() {
 			if err := w.Inject([]byte{'\r'}); err != nil {
 				logger.Printf("pty auto-yes inject failed: %v", err)
@@ -250,6 +252,10 @@ func enrich(
 			continue
 		}
 
+		if f.Status == "busy" {
+			ay.SetInPermissionPrompt(false)
+		}
+
 		mu.Lock()
 		statusChanged := sess.Status != f.Status
 		idChanged := f.SessionID != "" && f.SessionID != currentSessID
@@ -272,7 +278,7 @@ func enrich(
 
 		// Idle notification: claude just stopped working and isn't blocked on
 		// a permission prompt. Fire at most once per 30s per wrapper.
-		if statusChanged && f.Status == "waiting" && prevStatus != "waiting" && !hasPending {
+		if statusChanged && f.Status == "waiting" && prevStatus != "waiting" && !hasPending && !ay.InPermissionPrompt() {
 			if time.Since(lastIdleNotify) > 30*time.Second {
 				notify.Notify(
 					fmt.Sprintf("Claude waiting for input · %s", sessionLabel(cwd, wrapperPID)),

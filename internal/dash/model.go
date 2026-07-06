@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -44,6 +45,9 @@ type Model struct {
 	logScrollOffset   int
 	logViewportHeight int
 	autoScroll        bool
+
+	keepAwake     bool
+	caffeinateCmd *exec.Cmd
 }
 
 func New() *Model {
@@ -527,23 +531,48 @@ func readPTYOutTail(path string) ([]string, error) {
 		}
 	}
 
-	// Collapse consecutive blank lines
-	var collapsed []string
-	wasBlank := false
-	for _, l := range lines {
-		isBlank := strings.TrimSpace(stripANSI(l)) == ""
-		if isBlank {
-			if wasBlank {
-				continue
-			}
-			wasBlank = true
-			l = ""
-		} else {
-			wasBlank = false
-		}
-		collapsed = append(collapsed, l)
+	return lines, nil
+}
+
+func (m *Model) updateKeepAwake() {
+	if !m.keepAwake {
+		m.stopCaffeinate()
+		return
 	}
 
-	return collapsed, nil
+	hasBusy := false
+	for _, s := range m.sessions {
+		if s.Status == "busy" {
+			hasBusy = true
+			break
+		}
+	}
+
+	if hasBusy {
+		m.startCaffeinate()
+	} else {
+		m.stopCaffeinate()
+	}
+}
+
+func (m *Model) startCaffeinate() {
+	if m.caffeinateCmd != nil {
+		return
+	}
+	cmd := exec.Command("caffeinate", "-i")
+	if err := cmd.Start(); err == nil {
+		m.caffeinateCmd = cmd
+	}
+}
+
+func (m *Model) stopCaffeinate() {
+	if m.caffeinateCmd == nil {
+		return
+	}
+	if m.caffeinateCmd.Process != nil {
+		_ = m.caffeinateCmd.Process.Kill()
+		_ = m.caffeinateCmd.Wait()
+	}
+	m.caffeinateCmd = nil
 }
 
