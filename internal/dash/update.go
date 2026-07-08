@@ -213,6 +213,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.updateKeepAwake()
 		return m, nil
+
+	case "f":
+		s := m.selected()
+		if s == nil {
+			return m, nil
+		}
+		err := FocusSession(s.WrapperPID)
+		if err != nil {
+			m.statusLine = "failed to focus: " + err.Error()
+		} else {
+			m.statusLine = "focused terminal for pid " + itoa(s.WrapperPID)
+		}
+		return m, nil
 	}
 	return m, nil
 }

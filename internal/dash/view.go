@@ -147,7 +147,7 @@ func (m *Model) View() string {
 		b.WriteString("\n")
 	}
 
-	help := "↑/↓ navigate · space toggle auto-yes · enter approve pending · A/N auto-yes all/none · p pending-only · w keep-awake · pgup/pgdn scroll logs · q quit"
+	help := "↑/↓ navigate · space toggle auto-yes · enter approve pending · f focus · A/N auto-yes all/none · p pending-only · w keep-awake · pgup/pgdn scroll logs · q quit"
 	b.WriteString(helpStyle.Render(help))
 
 	return b.String()

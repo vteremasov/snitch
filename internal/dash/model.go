@@ -281,6 +281,9 @@ type VirtualTerminal struct {
 	CursorCol    int
 	Height       int
 	CurrentStyle Style
+	SavedRow     int
+	SavedCol     int
+	SavedStyle   Style
 }
 
 func NewVirtualTerminal(height int) *VirtualTerminal {
@@ -313,6 +316,22 @@ func (vt *VirtualTerminal) Write(data string) {
 	for i < n {
 		r := runes[i]
 		if r == '\x1b' {
+			if i+1 < n {
+				if runes[i+1] == '7' {
+					vt.SavedRow = vt.CursorRow
+					vt.SavedCol = vt.CursorCol
+					vt.SavedStyle = vt.CurrentStyle
+					i += 2
+					continue
+				} else if runes[i+1] == '8' {
+					vt.CursorRow = vt.SavedRow
+					vt.CursorCol = vt.SavedCol
+					vt.CurrentStyle = vt.SavedStyle
+					vt.clampCursor()
+					i += 2
+					continue
+				}
+			}
 			if i+1 < n && (runes[i+1] == '[' || runes[i+1] == ']') {
 				j := i + 1
 				if runes[i+1] == '[' {
@@ -355,6 +374,30 @@ func (vt *VirtualTerminal) Write(data string) {
 							}
 							vt.CursorRow += steps
 							vt.clampCursor()
+						case 'C': // Cursor Forward
+							steps := 1
+							if len(params) > 0 && params[0] > 0 {
+								steps = params[0]
+							}
+							vt.CursorCol += steps
+						case 'D': // Cursor Backward
+							steps := 1
+							if len(params) > 0 && params[0] > 0 {
+								steps = params[0]
+							}
+							vt.CursorCol -= steps
+							if vt.CursorCol < 0 {
+								vt.CursorCol = 0
+							}
+						case 'G': // Cursor Horizontal Absolute
+							col := 0
+							if len(params) > 0 && params[0] > 0 {
+								col = params[0] - 1
+							}
+							vt.CursorCol = col
+							if vt.CursorCol < 0 {
+								vt.CursorCol = 0
+							}
 						case 'H', 'f': // Cursor Position
 							vt.CursorRow = 0
 							vt.CursorCol = 0
@@ -559,8 +602,7 @@ func (m *Model) startCaffeinate() {
 	if m.caffeinateCmd != nil {
 		return
 	}
-	cmd := exec.Command("caffeinate", "-i")
-	if err := cmd.Start(); err == nil {
+	if cmd, err := startInhibitor(); err == nil {
 		m.caffeinateCmd = cmd
 	}
 }
